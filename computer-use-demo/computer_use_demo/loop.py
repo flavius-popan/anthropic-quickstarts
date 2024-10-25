@@ -1,12 +1,14 @@
 """
-Agentic sampling loop that calls the Anthropic API and local implementation of anthropic-defined computer use tools.
+Agentic sampling loop that calls the Anthropic API and local implementation of
+anthropic-defined computer use tools.
 """
 
+import asyncio
 import platform
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, List, Optional, Tuple, cast
 
 import httpx
 from anthropic import (
@@ -48,26 +50,169 @@ PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
 }
 
 
-# This system prompt is optimized for the Docker environment in this repository and
-# specific tool combinations enabled.
-# We encourage modifying this system prompt to ensure the model has context for the
-# environment it is running in, and to provide any additional information that may be
-# helpful for the task at hand.
+# This system prompt is optimized for the Docker environment in this repository
 SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
-* You are utilising an Ubuntu virtual machine using {platform.machine()} architecture with internet access.
-* You can feel free to install Ubuntu applications with your bash tool. Use curl instead of wget.
-* To open firefox, please just click on the firefox icon.  Note, firefox-esr is what is installed on your system.
-* Using bash tool you can start GUI applications, but you need to set export DISPLAY=:1 and use a subshell. For example "(DISPLAY=:1 xterm &)". GUI apps run with bash tool will appear within your desktop environment, but they may take some time to appear. Take a screenshot to confirm it did.
-* When using your bash tool with commands that are expected to output very large quantities of text, redirect into a tmp file and use str_replace_editor or `grep -n -B <lines before> -A <lines after> <query> <filename>` to confirm output.
-* When viewing a page it can be helpful to zoom out so that you can see everything on the page.  Either that, or make sure you scroll down to see everything before deciding something isn't available.
-* When using your computer function calls, they take a while to run and send back to you.  Where possible/feasible, try to chain multiple of these calls all into one function calls request.
+* You are utilising an Ubuntu virtual machine using {platform.machine()}
+  architecture with internet access.
+* You can feel free to install Ubuntu applications with your bash tool. Use curl
+  instead of wget.
+* To open firefox, please just click on the firefox icon. Note, firefox-esr is
+  what is installed on your system.
+* Using bash tool you can start GUI applications, but you need to set export
+  DISPLAY=:1 and use a subshell. For example "(DISPLAY=:1 xterm &)". GUI apps
+  run with bash tool will appear within your desktop environment, but they may
+  take some time to appear. Take a screenshot to confirm it did.
+* When using your bash tool with commands that are expected to output very large
+  quantities of text, redirect into a tmp file and use str_replace_editor or
+  `grep -n -B <lines before> -A <lines after> <query> <filename>` to confirm
+  output.
+* When viewing a page it can be helpful to zoom out so that you can see
+  everything on the page. Either that, or make sure you scroll down to see
+  everything before deciding something isn't available.
+* When using your computer function calls, they take a while to run and send
+  back to you. Where possible/feasible, try to chain multiple of these calls
+  all into one function calls request.
 * The current date is {datetime.today().strftime('%A, %B %-d, %Y')}.
 </SYSTEM_CAPABILITY>
 
 <IMPORTANT>
-* When using Firefox, if a startup wizard appears, IGNORE IT.  Do not even click "skip this step".  Instead, click on the address bar where it says "Search or enter address", and enter the appropriate search term or URL there.
-* If the item you are looking at is a pdf, if after taking a single screenshot of the pdf it seems that you want to read the entire document instead of trying to continue to read the pdf from your screenshots + navigation, determine the URL, use curl to download the pdf, install and use pdftotext to convert it to a text file, and then read that text file directly with your StrReplaceEditTool.
+* When using Firefox, if a startup wizard appears, IGNORE IT. Do not even click
+  "skip this step". Instead, click on the address bar where it says "Search or
+  enter address", and enter the appropriate search term or URL there.
+* If the item you are looking at is a pdf, if after taking a single screenshot
+  of the pdf it seems that you want to read the entire document instead of
+  trying to continue to read the pdf from your screenshots + navigation,
+  determine the URL, use curl to download the pdf, install and use pdftotext
+  to convert it to a text file, and then read that text file directly with
+  your StrReplaceEditTool.
 </IMPORTANT>"""
+
+
+def _inject_prompt_caching(
+    messages: list[BetaMessageParam],
+):
+    """Set cache breakpoints for the 3 most recent turns."""
+    breakpoints_remaining = 3
+    for message in reversed(messages):
+        if message["role"] == "user" and isinstance(
+            content := message["content"], list
+        ):
+            if breakpoints_remaining:
+                breakpoints_remaining -= 1
+                content[-1]["cache_control"] = BetaCacheControlEphemeralParam(
+                    {"type": "ephemeral"}
+                )
+            else:
+                content[-1].pop("cache_control", None)
+                break
+
+
+def _make_api_tool_result(
+    result: ToolResult, tool_use_id: str
+) -> BetaToolResultBlockParam:
+    """Convert an agent ToolResult to an API ToolResultBlockParam."""
+    tool_result_content: list[BetaTextBlockParam | BetaImageBlockParam] = []
+    is_error = False
+    if result.error:
+        is_error = True
+        tool_result_content.append(
+            {
+                "type": "text",
+                "text": _maybe_prepend_system_tool_result(result, result.error),
+            }
+        )
+    else:
+        if result.output:
+            tool_result_content.append(
+                {
+                    "type": "text",
+                    "text": _maybe_prepend_system_tool_result(result, result.output),
+                }
+            )
+        if result.base64_image:
+            tool_result_content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": result.base64_image,
+                    },
+                }
+            )
+    return {
+        "type": "tool_result",
+        "content": tool_result_content,
+        "tool_use_id": tool_use_id,
+        "is_error": is_error,
+    }
+
+
+def _maybe_prepend_system_tool_result(result: ToolResult, result_text: str) -> str:
+    """Prepend system info to tool result if present."""
+    if result.system:
+        result_text = f"<system>{result.system}</system>\n{result_text}"
+    return result_text
+
+
+def _response_to_params(
+    response: BetaMessage,
+) -> list[BetaTextBlockParam | BetaToolUseBlockParam]:
+    """Convert API response to parameters."""
+    res: list[BetaTextBlockParam | BetaToolUseBlockParam] = []
+    for block in response.content:
+        if isinstance(block, BetaTextBlock):
+            res.append({"type": "text", "text": block.text})
+        else:
+            res.append(cast(BetaToolUseBlockParam, block.model_dump()))
+    return res
+
+
+async def check_rate_limits(
+    api_calls: List[datetime],
+    total_tokens: List[Tuple[int, datetime]],
+    rate_limit_rpm: int,
+    rate_limit_tpm: int,
+) -> float:
+    """Check current rate limits and return delay needed (if any)"""
+    now = datetime.now()
+    minute_ago = now - timedelta(minutes=1)
+
+    # Count recent calls
+    recent_calls = [c for c in api_calls if c > minute_ago]
+    recent_tokens = [t for t, ts in total_tokens if ts > minute_ago]
+
+    # Calculate current rates
+    current_rpm = len(recent_calls)
+    current_tpm = sum(recent_tokens)
+
+    # Calculate how close we are to limits
+    rpm_ratio = current_rpm / rate_limit_rpm if rate_limit_rpm else 0
+    tpm_ratio = current_tpm / rate_limit_tpm if rate_limit_tpm else 0
+
+    # If we're over 80% of either limit, calculate delay needed
+    if rpm_ratio > 0.8 or tpm_ratio > 0.8:
+        # Find the oldest call/token usage in the last minute
+        if recent_calls:
+            oldest_call = min(recent_calls)
+            seconds_until_call_drops = (
+                oldest_call + timedelta(minutes=1) - now
+            ).total_seconds()
+        else:
+            seconds_until_call_drops = 0
+
+        if recent_tokens:
+            oldest_token = min(ts for _, ts in total_tokens if ts > minute_ago)
+            seconds_until_token_drops = (
+                oldest_token + timedelta(minutes=1) - now
+            ).total_seconds()
+        else:
+            seconds_until_token_drops = 0
+
+        # Return the longer delay
+        return max(seconds_until_call_drops, seconds_until_token_drops)
+
+    return 0
 
 
 async def sampling_loop(
@@ -82,12 +227,15 @@ async def sampling_loop(
         [httpx.Request, httpx.Response | object | None, Exception | None], None
     ],
     api_key: str,
-    only_n_most_recent_images: int | None = None,
+    only_n_most_recent_images: Optional[int] = None,
     max_tokens: int = 4096,
+    enable_rate_limiting: bool = True,
+    rate_limit_rpm: int = 0,
+    rate_limit_tpm: int = 0,
+    api_calls: Optional[List[datetime]] = None,
+    total_tokens: Optional[List[Tuple[int, datetime]]] = None,
 ):
-    """
-    Agentic sampling loop for the assistant/tool interaction of computer use.
-    """
+    """Agentic sampling loop for the assistant/tool interaction of computer use."""
     tool_collection = ToolCollection(
         ComputerTool(),
         BashTool(),
@@ -95,10 +243,25 @@ async def sampling_loop(
     )
     system = BetaTextBlockParam(
         type="text",
-        text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
+        text=f"{SYSTEM_PROMPT}"
+        f"{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
     )
 
+    # Initialize rate limiting lists if None
+    if api_calls is None:
+        api_calls = []
+    if total_tokens is None:
+        total_tokens = []
+
     while True:
+        # Check rate limits if enabled
+        if enable_rate_limiting and rate_limit_rpm and rate_limit_tpm:
+            delay = await check_rate_limits(
+                api_calls, total_tokens, rate_limit_rpm, rate_limit_tpm
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+
         enable_prompt_caching = False
         betas = [COMPUTER_USE_BETA_FLAG]
         image_truncation_threshold = 10
@@ -113,7 +276,6 @@ async def sampling_loop(
         if enable_prompt_caching:
             betas.append(PROMPT_CACHING_BETA_FLAG)
             _inject_prompt_caching(messages)
-            # Is it ever worth it to bust the cache with prompt caching?
             image_truncation_threshold = 50
             system["cache_control"] = {"type": "ephemeral"}
 
@@ -124,10 +286,6 @@ async def sampling_loop(
                 min_removal_threshold=image_truncation_threshold,
             )
 
-        # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
         try:
             raw_response = client.beta.messages.with_raw_response.create(
                 max_tokens=max_tokens,
@@ -182,12 +340,7 @@ def _maybe_filter_to_n_most_recent_images(
     images_to_keep: int,
     min_removal_threshold: int,
 ):
-    """
-    With the assumption that images are screenshots that are of diminishing value as
-    the conversation progresses, remove all but the final `images_to_keep` tool_result
-    images in place, with a chunk of min_removal_threshold to reduce the amount we
-    break the implicit prompt cache.
-    """
+    """Filter to keep only N most recent images."""
     if images_to_keep is None:
         return messages
 
@@ -211,7 +364,6 @@ def _maybe_filter_to_n_most_recent_images(
     )
 
     images_to_remove = total_images - images_to_keep
-    # for better cache behavior, we want to remove in chunks
     images_to_remove -= images_to_remove % min_removal_threshold
 
     for tool_result in tool_result_blocks:
@@ -224,81 +376,3 @@ def _maybe_filter_to_n_most_recent_images(
                         continue
                 new_content.append(content)
             tool_result["content"] = new_content
-
-
-def _response_to_params(
-    response: BetaMessage,
-) -> list[BetaTextBlockParam | BetaToolUseBlockParam]:
-    res: list[BetaTextBlockParam | BetaToolUseBlockParam] = []
-    for block in response.content:
-        if isinstance(block, BetaTextBlock):
-            res.append({"type": "text", "text": block.text})
-        else:
-            res.append(cast(BetaToolUseBlockParam, block.model_dump()))
-    return res
-
-
-def _inject_prompt_caching(
-    messages: list[BetaMessageParam],
-):
-    """
-    Set cache breakpoints for the 3 most recent turns
-    one cache breakpoint is left for tools/system prompt, to be shared across sessions
-    """
-
-    breakpoints_remaining = 3
-    for message in reversed(messages):
-        if message["role"] == "user" and isinstance(
-            content := message["content"], list
-        ):
-            if breakpoints_remaining:
-                breakpoints_remaining -= 1
-                content[-1]["cache_control"] = BetaCacheControlEphemeralParam(
-                    {"type": "ephemeral"}
-                )
-            else:
-                content[-1].pop("cache_control", None)
-                # we'll only every have one extra turn per loop
-                break
-
-
-def _make_api_tool_result(
-    result: ToolResult, tool_use_id: str
-) -> BetaToolResultBlockParam:
-    """Convert an agent ToolResult to an API ToolResultBlockParam."""
-    tool_result_content: list[BetaTextBlockParam | BetaImageBlockParam] | str = []
-    is_error = False
-    if result.error:
-        is_error = True
-        tool_result_content = _maybe_prepend_system_tool_result(result, result.error)
-    else:
-        if result.output:
-            tool_result_content.append(
-                {
-                    "type": "text",
-                    "text": _maybe_prepend_system_tool_result(result, result.output),
-                }
-            )
-        if result.base64_image:
-            tool_result_content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": result.base64_image,
-                    },
-                }
-            )
-    return {
-        "type": "tool_result",
-        "content": tool_result_content,
-        "tool_use_id": tool_use_id,
-        "is_error": is_error,
-    }
-
-
-def _maybe_prepend_system_tool_result(result: ToolResult, result_text: str):
-    if result.system:
-        result_text = f"<system>{result.system}</system>\n{result_text}"
-    return result_text

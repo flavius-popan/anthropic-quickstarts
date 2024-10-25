@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from functools import partial
 from pathlib import PosixPath
-from typing import cast
+from typing import Union, cast
 
 import httpx
 import streamlit as st
@@ -45,7 +45,10 @@ STREAMLIT_STYLE = """
 </style>
 """
 
-WARNING_TEXT = "⚠️ Security Alert: Never provide access to sensitive accounts or data, as malicious web content can hijack Claude's behavior"
+WARNING_TEXT = (
+    "⚠️ Security Alert: Never provide access to sensitive accounts or data, "
+    "as malicious web content can hijack Claude's behavior"
+)
 
 
 class Sender(StrEnum):
@@ -54,7 +57,46 @@ class Sender(StrEnum):
     TOOL = "tool"
 
 
+def _render_message(
+    sender: Sender,
+    message: Union[str, BetaContentBlockParam, ToolResult],
+):
+    """Convert input from the user or output from the agent to a streamlit message."""
+    # streamlit's hotreloading breaks isinstance checks, so we need to check for class names
+    is_tool_result = not isinstance(message, (str, dict))
+    if not message or (
+        is_tool_result
+        and st.session_state.hide_images
+        and not hasattr(message, "error")
+        and not hasattr(message, "output")
+    ):
+        return
+    with st.chat_message(sender):
+        if is_tool_result:
+            message = cast(ToolResult, message)
+            if message.output:
+                if message.__class__.__name__ == "CLIResult":
+                    st.code(message.output)
+                else:
+                    st.markdown(message.output)
+            if message.error:
+                st.error(message.error)
+            if message.base64_image and not st.session_state.hide_images:
+                st.image(base64.b64decode(message.base64_image))
+        elif isinstance(message, dict):
+            if message["type"] == "text":
+                st.write(message["text"])
+            elif message["type"] == "tool_use":
+                st.code(f'Tool Use: {message["name"]}\nInput: {message["input"]}')
+            else:
+                # only expected return types are text and tool_use
+                raise Exception(f'Unexpected response type {message["type"]}')
+        else:
+            st.markdown(message)
+
+
 def setup_state():
+    """Initialize streamlit session state variables."""
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "api_key" not in st.session_state:
@@ -82,9 +124,20 @@ def setup_state():
         st.session_state.custom_system_prompt = load_from_storage("system_prompt") or ""
     if "hide_images" not in st.session_state:
         st.session_state.hide_images = False
+    if "enable_rate_limiting" not in st.session_state:
+        st.session_state.enable_rate_limiting = True
+    if "rate_limit_rpm" not in st.session_state:
+        st.session_state.rate_limit_rpm = 0  # Will be fetched from API
+    if "rate_limit_tpm" not in st.session_state:
+        st.session_state.rate_limit_tpm = 0  # Will be fetched from API
+    if "api_calls" not in st.session_state:
+        st.session_state.api_calls = []
+    if "total_tokens" not in st.session_state:
+        st.session_state.total_tokens = []
 
 
 def _reset_model():
+    """Reset model to default for current provider."""
     st.session_state.model = PROVIDER_TO_DEFAULT_MODEL_NAME[
         cast(APIProvider, st.session_state.provider)
     ]
@@ -128,16 +181,45 @@ async def main():
                 on_change=lambda: save_to_storage("api_key", st.session_state.api_key),
             )
 
+            # Rate Limit Settings
+            st.checkbox("Enable Rate Limiting", key="enable_rate_limiting")
+            if st.session_state.enable_rate_limiting:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Current RPM", st.session_state.rate_limit_rpm)
+                with col2:
+                    st.metric("Current TPM", st.session_state.rate_limit_tpm)
+
+                # Show current usage
+                now = datetime.now()
+                minute_ago = now - timedelta(minutes=1)
+                recent_calls = [c for c in st.session_state.api_calls if c > minute_ago]
+                recent_tokens = [
+                    t for t, ts in st.session_state.total_tokens if ts > minute_ago
+                ]
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Used RPM", len(recent_calls))
+                with col2:
+                    st.metric("Used TPM", sum(recent_tokens))
+
         st.number_input(
             "Only send N most recent images",
             min_value=0,
             key="only_n_most_recent_images",
-            help="To decrease the total tokens sent, remove older screenshots from the conversation",
+            help=(
+                "To decrease the total tokens sent, remove older screenshots "
+                "from the conversation"
+            ),
         )
         st.text_area(
             "Custom System Prompt Suffix",
             key="custom_system_prompt",
-            help="Additional instructions to append to the system prompt. see computer_use_demo/loop.py for the base system prompt.",
+            help=(
+                "Additional instructions to append to the system prompt. "
+                "see computer_use_demo/loop.py for the base system prompt."
+            ),
             on_change=lambda: save_to_storage(
                 "system_prompt", st.session_state.custom_system_prompt
             ),
@@ -174,11 +256,13 @@ async def main():
                 _render_message(message["role"], message["content"])
             elif isinstance(message["content"], list):
                 for block in message["content"]:
-                    # the tool result we send back to the Anthropic API isn't sufficient to render all details,
-                    # so we store the tool use responses
+                    # the tool result we send back to the Anthropic API isn't
+                    # sufficient to render all details, so we store the tool
+                    # use responses
                     if isinstance(block, dict) and block["type"] == "tool_result":
                         _render_message(
-                            Sender.TOOL, st.session_state.tools[block["tool_use_id"]]
+                            Sender.TOOL,
+                            st.session_state.tools[block["tool_use_id"]],
                         )
                     else:
                         _render_message(
@@ -227,10 +311,16 @@ async def main():
                 ),
                 api_key=st.session_state.api_key,
                 only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                enable_rate_limiting=st.session_state.enable_rate_limiting,
+                rate_limit_rpm=st.session_state.rate_limit_rpm,
+                rate_limit_tpm=st.session_state.rate_limit_tpm,
+                api_calls=st.session_state.api_calls,
+                total_tokens=st.session_state.total_tokens,
             )
 
 
 def validate_auth(provider: APIProvider, api_key: str | None):
+    """Validate authentication for the selected provider."""
     if provider == APIProvider.ANTHROPIC:
         if not api_key:
             return "Enter your Anthropic API key in the sidebar to continue."
@@ -244,7 +334,9 @@ def validate_auth(provider: APIProvider, api_key: str | None):
         from google.auth.exceptions import DefaultCredentialsError
 
         if not os.environ.get("CLOUD_ML_REGION"):
-            return "Set the CLOUD_ML_REGION environment variable to use the Vertex API."
+            return (
+                "Set the CLOUD_ML_REGION environment variable to use the " "Vertex API."
+            )
         try:
             google.auth.default(
                 scopes=["https://www.googleapis.com/auth/cloud-platform"],
@@ -285,11 +377,33 @@ def _api_response_callback(
     tab: DeltaGenerator,
     response_state: dict[str, tuple[httpx.Request, httpx.Response | object | None]],
 ):
-    """
-    Handle an API response by storing it to state and rendering it.
-    """
+    """Handle an API response by storing it to state and rendering it."""
     response_id = datetime.now().isoformat()
     response_state[response_id] = (request, response)
+
+    # Track API calls for rate limiting
+    if st.session_state.enable_rate_limiting:
+        st.session_state.api_calls.append(datetime.now())
+
+        # Extract and track token usage if available
+        if isinstance(response, httpx.Response):
+            try:
+                data = response.json()
+                usage = data.get("usage", {})
+                total_tokens = usage.get("total_tokens", 0)
+                if total_tokens:
+                    st.session_state.total_tokens.append((total_tokens, datetime.now()))
+            except (ValueError, AttributeError, KeyError):
+                pass
+
+            # Update rate limits from headers
+            rpm = response.headers.get("x-ratelimit-requests-limit")
+            tpm = response.headers.get("x-ratelimit-tokens-limit")
+            if rpm:
+                st.session_state.rate_limit_rpm = int(rpm)
+            if tpm:
+                st.session_state.rate_limit_tpm = int(tpm)
+
     if error:
         _render_error(error)
     _render_api_response(request, response, response_id, tab)
@@ -314,13 +428,15 @@ def _render_api_response(
         with st.expander(f"Request/Response ({response_id})"):
             newline = "\n\n"
             st.markdown(
-                f"`{request.method} {request.url}`{newline}{newline.join(f'`{k}: {v}`' for k, v in request.headers.items())}"
+                f"`{request.method} {request.url}`{newline}"
+                f"{newline.join(f'`{k}: {v}`' for k, v in request.headers.items())}"
             )
             st.json(request.read().decode())
             st.markdown("---")
             if isinstance(response, httpx.Response):
                 st.markdown(
-                    f"`{response.status_code}`{newline}{newline.join(f'`{k}: {v}`' for k, v in response.headers.items())}"
+                    f"`{response.status_code}`{newline}"
+                    f"{newline.join(f'`{k}: {v}`' for k, v in response.headers.items())}"
                 )
                 st.json(response.text)
             else:
@@ -328,10 +444,16 @@ def _render_api_response(
 
 
 def _render_error(error: Exception):
+    """Render an error message."""
     if isinstance(error, RateLimitError):
         body = "You have been rate limited."
         if retry_after := error.response.headers.get("retry-after"):
-            body += f" **Retry after {str(timedelta(seconds=int(retry_after)))} (HH:MM:SS).** See our API [documentation](https://docs.anthropic.com/en/api/rate-limits) for more details."
+            retry_time = str(timedelta(seconds=int(retry_after)))
+            body += (
+                f" **Retry after {retry_time} (HH:MM:SS).** "
+                f"See our API [documentation](https://docs.anthropic.com/en/api/rate-limits) "
+                f"for more details."
+            )
         body += f"\n\n{error.message}"
     else:
         body = str(error)
@@ -340,44 +462,6 @@ def _render_error(error: Exception):
         body += f"\n\n```{lines}```"
     save_to_storage(f"error_{datetime.now().timestamp()}.md", body)
     st.error(f"**{error.__class__.__name__}**\n\n{body}", icon=":material/error:")
-
-
-def _render_message(
-    sender: Sender,
-    message: str | BetaContentBlockParam | ToolResult,
-):
-    """Convert input from the user or output from the agent to a streamlit message."""
-    # streamlit's hotreloading breaks isinstance checks, so we need to check for class names
-    is_tool_result = not isinstance(message, str | dict)
-    if not message or (
-        is_tool_result
-        and st.session_state.hide_images
-        and not hasattr(message, "error")
-        and not hasattr(message, "output")
-    ):
-        return
-    with st.chat_message(sender):
-        if is_tool_result:
-            message = cast(ToolResult, message)
-            if message.output:
-                if message.__class__.__name__ == "CLIResult":
-                    st.code(message.output)
-                else:
-                    st.markdown(message.output)
-            if message.error:
-                st.error(message.error)
-            if message.base64_image and not st.session_state.hide_images:
-                st.image(base64.b64decode(message.base64_image))
-        elif isinstance(message, dict):
-            if message["type"] == "text":
-                st.write(message["text"])
-            elif message["type"] == "tool_use":
-                st.code(f'Tool Use: {message["name"]}\nInput: {message["input"]}')
-            else:
-                # only expected return types are text and tool_use
-                raise Exception(f'Unexpected response type {message["type"]}')
-        else:
-            st.markdown(message)
 
 
 if __name__ == "__main__":
